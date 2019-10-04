@@ -32,7 +32,7 @@ short_description: create, modify and delete AutoScaling Scheduled Actions.
 description:
   - Read the AWS documentation for Scheduled Actions
     U(http://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-as-scheduledaction.html
-version_added: "2.8"
+version_added: "2.10"
 requirements: [ "boto3", "botocore" ]
 options:
   autoscaling_group_name:
