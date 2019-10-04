@@ -39,36 +39,45 @@ options:
     description:
       - The name of the autoscaling group.
     required: true
+    type: str
   scheduled_action_name:
     description:
       - The name of the scheduled action.
     required: true
+    type: str
   state:
     description:
       - Whether the schedule is present or absent.
     required: false
     default: present
     choices: ['present', 'absent']
+    type: str
   desired_capacity:
     description:
       - The number of EC2 instances that should be running in the group.
     required: true
+    type: int
   recurrence:
     description:
       - The recurring schedule for this action, in Unix cron syntax format.
     required: true
+    type: str
   min_size:
     description:
       - Minimum number of instances in group.
+    type: int
   max_size:
     description:
       - Maximum number of instances in group.
+    type: int
   start_time:
     description:
       - The time for the scheduled action to start.
+    type: str
   end_time:
     description:
       - The time for the recurring schedule to end.
+    type: str
 author: Mike Mochan(@mmochan)
 extends_documentation_fragment:
     - aws
