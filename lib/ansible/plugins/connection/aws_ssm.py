@@ -21,6 +21,35 @@ requirements:
 - The control machine must have the aws session manager plugin installed.
 - The remote EC2 instance must have the curl installed.
 options:
+  aws_access_key:
+    description: The AWS access key to use.
+    type: str
+    env:
+      - name: EC2_ACCESS_KEY
+      - name: AWS_ACCESS_KEY
+      - name: AWS_ACCESS_KEY_ID
+    vars:
+    - name: aws_access_key
+    required: True
+  aws_secret_key:
+    description: The AWS secret key that corresponds to the access key.
+    type: str
+    env:
+      - name: EC2_SECRET_KEY
+      - name: AWS_SECRET_KEY
+      - name: AWS_SECRET_ACCESS_KEY
+    vars:
+    - name: aws_secret_key
+    required: True
+  aws_security_token:
+    description: The AWS security token if using temporary access and secret keys.
+    type: str
+    env:
+      - name: EC2_SECURITY_TOKEN
+      - name: AWS_SESSION_TOKEN
+      - name: AWS_SECURITY_TOKEN
+    vars:
+    - name: aws_security_token
   instance_id:
     description: The EC2 instance ID.
     vars:
@@ -216,6 +245,10 @@ def _ssm_retry(func):
         return return_tuple
     return wrapped
 
+def chunks(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 class Connection(ConnectionBase):
     ''' AWS SSM based connections '''
@@ -235,6 +268,7 @@ class Connection(ConnectionBase):
     def __init__(self, *args, **kwargs):
 
         super(Connection, self).__init__(*args, **kwargs)
+
         self.host = self._play_context.remote_addr
 
         if getattr(self._shell, "SHELL_FAMILY", '') == 'powershell':
@@ -245,18 +279,39 @@ class Connection(ConnectionBase):
             self.protocol = None
             self.shell_id = None
             self._shell_type = 'powershell'
+            self.is_windows = True
 
     def _connect(self):
         ''' connect to the host via ssm '''
 
         self._play_context.remote_user = getpass.getuser()
 
-        if getattr(self._shell, "SHELL_FAMILY", '') == 'powershell':
-            self.is_windows = True
         if not self._session_id:
             self.start_session()
         return self
 
+    def _get_client(self, client_type="ssm"):
+        access_key = self.get_option('aws_access_key')
+        secret_access_key = self.get_option('aws_secret_key')
+        security_token = self.get_option('aws_security_token')
+        region_name = self.get_option('region')
+        
+        if security_token is None:
+            return boto3.client(
+                client_type, 
+                region_name=region_name, 
+                aws_access_key_id=access_key, 
+                aws_secret_access_key=secret_access_key
+            )   
+        else:
+            return boto3.client(
+                client_type, 
+                region_name=region_name,
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_access_key,
+                aws_session_token=security_token
+            )
+        
     def start_session(self):
         ''' start ssm session '''
 
@@ -264,8 +319,6 @@ class Connection(ConnectionBase):
             self.instance_id = self.host
         else:
             self.instance_id = self.get_option('instance_id')
-
-        display.vvv(u"ESTABLISH SSM CONNECTION TO: {0}".format(self.instance_id), host=self.host)
 
         executable = self.get_option('plugin')
         if not os.path.exists(to_bytes(executable, errors='surrogate_or_strict')):
@@ -276,8 +329,9 @@ class Connection(ConnectionBase):
         region_name = self.get_option('region')
         ssm_parameters = dict()
 
-        client = boto3.client('ssm', region_name=region_name)
-        self._client = client
+        client = self._get_client()
+        self._client = self._get_client()
+        display.vvv(u"ESTABLISH SSM CONNECTION TO: {0}".format(self.instance_id), host=self.host)
         response = client.start_session(Target=self.instance_id, Parameters=ssm_parameters)
         self._session_id = response['SessionId']
 
@@ -316,6 +370,8 @@ class Connection(ConnectionBase):
 
         return session
 
+
+
     @_ssm_retry
     def exec_command(self, cmd, in_data=None, sudoable=True):
         ''' run a command on the ssm host '''
@@ -331,14 +387,11 @@ class Connection(ConnectionBase):
 
         # Wrap command in markers accordingly for the shell used
         cmd = self._wrap_command(cmd, sudoable, mark_start, mark_end)
-
         self._flush_stderr(session)
 
         # Handle the back-end throttling
-        for c in cmd:
-            session.stdin.write(c.encode('utf-8'))
-            if self.is_windows:
-                time.sleep(15 / 1000.0)
+        for chunk in chunks(cmd,1024):
+            session.stdin.write(to_bytes(chunk, errors='surrogate_or_strict'))
 
         # Read stdout between the markers
         stdout = ''
@@ -349,8 +402,8 @@ class Connection(ConnectionBase):
             if remaining < 1:
                 self._timeout = True
                 display.vvvv(u"EXEC timeout stdout: {0}".format(to_text(stdout)), host=self.host)
-                raise AnsibleConnectionFailure("SSM exec_command timeout on host: %s"
-                                               % self.instance_id)
+                raise AnsibleConnectionFailure("SSM exec_command timeout on host: %s" % self.instance_id)
+            
             if self._poll_stdout.poll(1000):
                 line = self._filter_ansi(self._stdout.readline())
                 display.vvvv(u"EXEC stdout line: {0}".format(to_text(line)), host=self.host)
@@ -359,7 +412,11 @@ class Connection(ConnectionBase):
                 continue
 
             if mark_start in line:
-                begin = True
+                if self.is_windows:
+                    begin = True
+                else:
+                    if line.startswith("$") or line.strip() == mark_start:
+                        begin = True
                 if not line.startswith(mark_start):
                     stdout = ''
                 continue
@@ -373,7 +430,6 @@ class Connection(ConnectionBase):
                     stdout = stdout + line
 
         stderr = self._flush_stderr(session)
-
         return (returncode, stdout, stderr)
 
     def _prepare_terminal(self):
@@ -381,16 +437,14 @@ class Connection(ConnectionBase):
 
         if not self.is_windows:
             cmd = "stty -echo\n" + "PS1=''\n"
-            if PY3:
-                cmd = to_bytes(cmd)
+            cmd = to_bytes(cmd, errors='surrogate_or_strict')
             self._session.stdin.write(cmd)
 
     def _wrap_command(self, cmd, sudoable, mark_start, mark_end):
         ''' wrap command so stdout and status can be extracted '''
 
         if self.is_windows:
-            cmd = cmd + "; echo " + mark_start + " $? $LASTEXITCODE\necho " + mark_end + "\n"
-            time.sleep(1)
+            cmd = cmd + "; echo " + mark_start + " $LASTEXITCODE\necho " + mark_end + "\n"
         else:
             if sudoable:
                 cmd = "sudo " + cmd
@@ -401,23 +455,18 @@ class Connection(ConnectionBase):
 
     def _post_process(self, stdout):
         ''' extract command status and strip unwanted lines '''
-
         if self.is_windows:
-            success = stdout.rfind('True')
-            fail = stdout.rfind('False')
-
-            if success > fail:
-                returncode = 0
-                stdout = stdout[:success]
-            elif fail > success:
-                try:
-                    # test using: ansible -m raw -a 'cmd /c exit 99'
-                    returncode = int(stdout[fail:].split()[1])
-                except (IndexError, ValueError):
-                    returncode = -1
-                stdout = stdout[:fail]
+            stdout = stdout[:stdout.rfind('\n')]
+            # Minor change here to allow raw commands to execute
+            # Noticed that Windows does not return the LASTEXITCODE and thus fails to interpret the value as int
+            if stdout.splitlines()[-1].isdigit():
+                returncode = int(stdout.splitlines()[-1])
+                stdout = stdout[:stdout.rfind('\n') + 1]
+                # stdout = stdout.replace('\r\n', '').replace('\n', '')
             else:
-                returncode = -51
+                returncode = 0 # Default to success, may need to change this
+            # Replace new lines in stdout to fix gather facts, most return commands from windows
+            stdout = stdout.replace('\r\n', '').replace('\n', '')
 
             return (returncode, stdout)
         else:
@@ -426,15 +475,18 @@ class Connection(ConnectionBase):
 
             # Throw away ending lines
             for x in range(0, 3):
-                stdout = stdout[:stdout.rfind('\n')]
+                stdout = stdout[:stdout.rfind('\n')] 
+            # stdout = stdout.strip()
 
             return (returncode, stdout)
 
     def _filter_ansi(self, line):
         ''' remove any ANSI terminal control codes '''
-        line = line.decode('utf-8')
+        line = to_text(line)
 
         if self.is_windows:
+            osc_filter = re.compile(r'\x1b\][^\x07]*\x07')
+            line = osc_filter.sub('', line)
             ansi_filter = re.compile(r'(\x9B|\x1B\[)[0-?]*[ -/]*[@-~]')
             line = ansi_filter.sub('', line)
 
@@ -462,10 +514,10 @@ class Connection(ConnectionBase):
 
         return stderr
 
-    def _get_url(self, client_method, bucket_name, out_path, http_method):
+    def _get_url(self, client_method, bucket_name, out_path):
         ''' Generate URL for get_object / put_object '''
-        client = boto3.client('s3')
-        return client.generate_presigned_url(client_method, Params={'Bucket': bucket_name, 'Key': out_path}, ExpiresIn=3600, HttpMethod=http_method)
+        client = self._get_client(client_type='s3')
+        return client.generate_presigned_url(client_method, Params={'Bucket': bucket_name, 'Key': out_path}, ExpiresIn=3600)
 
     @_ssm_retry
     def _file_transport_command(self, in_path, out_path, ssm_action):
@@ -475,19 +527,19 @@ class Connection(ConnectionBase):
         bucket_url = 's3://%s/%s' % (self.get_option('bucket_name'), s3_path)
 
         if self.is_windows:
-            put_command = "curl -Method PUT -InFile '%s' -Uri '%s'" % (in_path, self._get_url('put_object', self.get_option('bucket_name'), s3_path, 'PUT'))
+            put_command = "Invoke-WebRequest -Method PUT -InFile '%s' -Uri '%s'" % (in_path, self._get_url('put_object', self.get_option('bucket_name'), s3_path))
+            get_command = "Invoke-WebRequest '%s' -OutFile '%s'" % (self._get_url('get_object', self.get_option('bucket_name'), s3_path), out_path)
         else:
-            put_command = "curl --request PUT --upload-file '%s' '%s'" % (in_path, self._get_url('put_object', self.get_option('bucket_name'), s3_path, 'PUT'))
+            put_command = "curl --request PUT --upload-file '%s' '%s'" % (in_path, self._get_url('put_object', self.get_option('bucket_name'), s3_path))
+            get_command = "curl '%s' -o '%s'" % (self._get_url('get_object', self.get_option('bucket_name'), s3_path), out_path)
 
-        get_command = "curl '%s' -o '%s'" % (self._get_url('get_object', self.get_option('bucket_name'), s3_path, 'GET'), out_path)
-
-        client = boto3.client('s3')
+        client = self._get_client(client_type='s3')
         if ssm_action == 'get':
             (returncode, stdout, stderr) = self.exec_command(put_command, in_data=None, sudoable=False)
-            with open(out_path.encode('utf-8'), 'wb') as data:
+            with open(to_bytes(out_path, errors='surrogate_or_strict'), 'wb') as data:
                 client.download_fileobj(self.get_option('bucket_name'), s3_path, data)
         else:
-            with open(in_path.encode('utf-8'), 'rb') as data:
+            with open(to_bytes(in_path, errors='surrogate_or_strict'), 'rb') as data:
                 client.upload_fileobj(data, self.get_option('bucket_name'), s3_path)
             (returncode, stdout, stderr) = self.exec_command(get_command, in_data=None, sudoable=False)
 
@@ -525,9 +577,7 @@ class Connection(ConnectionBase):
             if self._timeout:
                 self._session.terminate()
             else:
-                cmd = "\nexit\n"
-                if PY3:
-                    cmd = to_bytes(cmd)
+                cmd = b"\nexit\n"
                 self._session.communicate(cmd)
 
             display.vvvv(u"TERMINATE SSM SESSION: {0}".format(self._session_id), host=self.host)
