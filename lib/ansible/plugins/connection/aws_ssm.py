@@ -15,11 +15,11 @@ connection: aws_ssm
 short_description: execute via AWS Systems Manager
 description:
 - This connection plugin allows ansible to execute tasks on an EC2 instance via the aws ssm CLI.
-version_added: "2.8"
+version_added: "2.10"
 requirements:
 - The remote EC2 instance must be running the AWS Systems Manager Agent (SSM Agent).
 - The control machine must have the aws session manager plugin installed.
-- The remote EC2 instance must have the curl installed.
+- The remote EC2 linux instance must have the curl installed.
 options:
   aws_access_key:
     description: The AWS access key to use.
@@ -194,6 +194,7 @@ from ansible.module_utils.six import PY3
 from ansible.module_utils.six.moves import xrange
 from ansible.module_utils._text import to_bytes, to_native, to_text
 from ansible.plugins.connection import ConnectionBase
+from ansible.plugins.shell.powershell import _common_args
 from ansible.utils.display import Display
 
 display = Display()
@@ -249,6 +250,12 @@ def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
+
+def chunks(lst, n):
+    """Yield successive n-sized chunks from lst."""
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
 
 class Connection(ConnectionBase):
     ''' AWS SSM based connections '''
@@ -390,7 +397,7 @@ class Connection(ConnectionBase):
         self._flush_stderr(session)
 
         # Handle the back-end throttling
-        for chunk in chunks(cmd,1024):
+        for chunk in chunks(cmd, 1024):
             session.stdin.write(to_bytes(chunk, errors='surrogate_or_strict'))
 
         # Read stdout between the markers
@@ -444,6 +451,8 @@ class Connection(ConnectionBase):
         ''' wrap command so stdout and status can be extracted '''
 
         if self.is_windows:
+            if not cmd.startswith(" ".join(_common_args) + " -EncodedCommand"):
+                cmd = self._shell._encode_script(cmd, preserve_rc=True)
             cmd = cmd + "; echo " + mark_start + " $LASTEXITCODE\necho " + mark_end + "\n"
         else:
             if sudoable:
@@ -457,12 +466,14 @@ class Connection(ConnectionBase):
         ''' extract command status and strip unwanted lines '''
         if self.is_windows:
             stdout = stdout[:stdout.rfind('\n')]
-            # Minor change here to allow raw commands to execute
-            # Noticed that Windows does not return the LASTEXITCODE and thus fails to interpret the value as int
             if stdout.splitlines()[-1].isdigit():
                 returncode = int(stdout.splitlines()[-1])
                 stdout = stdout[:stdout.rfind('\n') + 1]
-                # stdout = stdout.replace('\r\n', '').replace('\n', '')
+                stdout = stdout.replace('\r\n', '')
+                if stdout.endswith('\n0'):
+                    stdout = stdout[:-2]
+                if stdout.startswith('{'):
+                    stdout = stdout.replace('\n', '')
             else:
                 returncode = 0 # Default to success, may need to change this
             # Replace new lines in stdout to fix gather facts, most return commands from windows
@@ -527,11 +538,15 @@ class Connection(ConnectionBase):
         bucket_url = 's3://%s/%s' % (self.get_option('bucket_name'), s3_path)
 
         if self.is_windows:
-            put_command = "Invoke-WebRequest -Method PUT -InFile '%s' -Uri '%s'" % (in_path, self._get_url('put_object', self.get_option('bucket_name'), s3_path))
-            get_command = "Invoke-WebRequest '%s' -OutFile '%s'" % (self._get_url('get_object', self.get_option('bucket_name'), s3_path), out_path)
+            put_command = "Invoke-WebRequest -Method PUT -InFile '%s' -Uri '%s' -UseBasicParsing" % (
+                in_path, self._get_url('put_object', self.get_option('bucket_name'), s3_path, 'PUT'))
+            get_command = "Invoke-WebRequest '%s' -OutFile '%s'" % (
+                self._get_url('get_object', self.get_option('bucket_name'), s3_path, 'GET'), out_path)
         else:
-            put_command = "curl --request PUT --upload-file '%s' '%s'" % (in_path, self._get_url('put_object', self.get_option('bucket_name'), s3_path))
-            get_command = "curl '%s' -o '%s'" % (self._get_url('get_object', self.get_option('bucket_name'), s3_path), out_path)
+            put_command = "curl --request PUT --upload-file '%s' '%s'" % (
+                in_path, self._get_url('put_object', self.get_option('bucket_name'), s3_path, 'PUT'))
+            get_command = "curl '%s' -o '%s'" % (
+                self._get_url('get_object', self.get_option('bucket_name'), s3_path, 'GET'), out_path)
 
         client = self._get_client(client_type='s3')
         if ssm_action == 'get':
